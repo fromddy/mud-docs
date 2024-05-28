@@ -1,0 +1,208 @@
+import { CollapseCode } from "../../../components/CollapseCode";
+
+# Filter data synchronization
+
+In this tutorial you modify `networkSetup.ts` to filter the information you synchronize.
+Filtering information this way allows you to reduce the use of network resources and makes loading times faster.
+
+## Setup
+
+To see the effects of filtering we need a table with entries to filter. To get such a table:
+
+1. [Create a new MUD application from the `vanilla` template](/quickstart).
+1. [Run the guide to add a table](./add-table).
+
+## Filtering
+
+Edit `packages/client/src/mud/setupNetwork.ts`.
+
+- Import [`pad`](https://viem.sh/docs/utilities/pad.html) from viem.
+- Add a `filters` field to the `syncToRecs` call.
+
+<CollapseCode>
+
+```ts filename="setupNetwork.ts" copy showLineNumbers {23,93-105}
+/*
+ * The MUD client code is built on top of viem
+ * (https://viem.sh/docs/getting-started.html).
+ * This line imports the functions we need from it.
+ */
+import {
+  createPublicClient,
+  fallback,
+  webSocket,
+  http,
+  createWalletClient,
+  Hex,
+  ClientConfig,
+  getContract,
+} from "viem";
+import { encodeEntity, syncToRecs } from "@latticexyz/store-sync/recs";
+
+import { getNetworkConfig } from "./getNetworkConfig";
+import { world } from "./world";
+import IWorldAbi from "contracts/out/IWorld.sol/IWorld.abi.json";
+import { createBurnerAccount, transportObserver, ContractWrite } from "@latticexyz/common";
+import { transactionQueue, writeObserver } from "@latticexyz/common/actions";
+import { pad } from "viem";
+
+import { Subject, share } from "rxjs";
+
+/*
+ * Import our MUD config, which includes strong types for
+ * our tables and other config options. We use this to generate
+ * things like RECS components and get back strong types for them.
+ *
+ * See https://mud.dev/templates/typescript/contracts#mudconfigts
+ * for the source of this information.
+ */
+import mudConfig from "contracts/mud.config";
+
+export type SetupNetworkResult = Awaited<ReturnType<typeof setupNetwork>>;
+
+export async function setupNetwork() {
+  const networkConfig = await getNetworkConfig();
+
+  /*
+   * Create a viem public (read only) client
+   * (https://viem.sh/docs/clients/public.html)
+   */
+  const clientOptions = {
+    chain: networkConfig.chain,
+    transport: transportObserver(fallback([webSocket(), http()])),
+    pollingInterval: 1000,
+  } as const satisfies ClientConfig;
+
+  const publicClient = createPublicClient(clientOptions);
+
+  /*
+   * Create an observable for contract writes that we can
+   * pass into MUD dev tools for transaction observability.
+   */
+  const write$ = new Subject<ContractWrite>();
+
+  /*
+   * Create a temporary wallet and a viem client for it
+   * (see https://viem.sh/docs/clients/wallet.html).
+   */
+  const burnerAccount = createBurnerAccount(networkConfig.privateKey as Hex);
+  const burnerWalletClient = createWalletClient({
+    ...clientOptions,
+    account: burnerAccount,
+  })
+    .extend(transactionQueue())
+    .extend(writeObserver({ onWrite: (write) => write$.next(write) }));
+
+  /*
+   * Create an object for communicating with the deployed World.
+   */
+  const worldContract = getContract({
+    address: networkConfig.worldAddress as Hex,
+    abi: IWorldAbi,
+    client: { public: publicClient, wallet: burnerWalletClient },
+  });
+
+  /*
+   * Sync on-chain state into RECS and keeps our client in sync.
+   * Uses the MUD indexer if available, otherwise falls back
+   * to the viem publicClient to make RPC calls to fetch MUD
+   * events from the chain.
+   */
+  const { components, latestBlock$, storedBlockLogs$, waitForTransaction } = await syncToRecs({
+    world,
+    config: mudConfig,
+    address: networkConfig.worldAddress as Hex,
+    publicClient,
+    startBlock: BigInt(networkConfig.initialBlockNumber),
+    filters: [
+      {
+        tableId: mudConfig.tables.app__Counter.tableId,
+      },
+      {
+        tableId: mudConfig.tables.app__History.tableId,
+        key0: pad("0x01"),
+      },
+      {
+        tableId: mudConfig.tables.app__History.tableId,
+        key0: pad("0x05"),
+      },
+    ],
+  });
+
+  return {
+    world,
+    components,
+    playerEntity: encodeEntity({ address: "address" }, { address: burnerWalletClient.account.address }),
+    publicClient,
+    walletClient: burnerWalletClient,
+    latestBlock$,
+    storedBlockLogs$,
+    waitForTransaction,
+    worldContract,
+    write$: write$.asObservable().pipe(share()),
+  };
+}
+```
+
+</CollapseCode>
+
+Click **Increment** a few times to see you only see the history for counter values 1 and 5.
+You can also go to the MUD Dev Tools and see that when you select **Components > app\_\_History** it only has those lines.
+
+### Explanation
+
+The `filters` field contains a list of filters.
+Only rows that match at least one line are synchronized.
+Each filter is a structure that can have up to three fields, and all the fields that are specified must match a row for the filter to match.
+
+- `tableId`, the table ID to synchronize.
+  You can read this value from `mudConfig.tables`.
+- `key0`, the first key value (as a 32 byte hexadecimal string).
+- `key1`, the second key value (as a 32 byte hexadecimal string).
+
+<details>
+
+<summary>The filters in the code sample</summary>
+
+```ts
+    filters: [
+      {
+         tableId: mudConfig.tables.app__Counter.tableId,
+      },
+```
+
+The first filter is for the `app__Counter` table (`Counter` in the `app` namespace).
+We don't specify any keys, because we want all the rows of the table.
+It's a singleton so there is only one row anyway.
+
+```ts
+      {
+         tableId: mudConfig.tables.app__History.tableId,
+         key0: pad("0x01"),
+      },
+      {
+         tableId: mudConfig.tables.app__History.tableId,
+         key0: pad("0x05"),
+      },
+    ],
+```
+
+These two filters apply to the `History` table.
+This table has just one key, the counter value which the row documents.
+We need a separate filter for every value, and here we have two we care about: `1` and `5`.
+
+</details>
+
+## Limitations
+
+There are several limitations on filters.
+
+- We can only filter on these fields:
+  - The table ID (`tableId`)
+  - The first key (`key0`)
+  - The second key (`key1`)
+- We can only filter by checking for equality.
+  We cannot check ranges, or get all values except for a specific one (inequality).
+
+Of course, once we have the data we can filter it any way we want.
+The purpose of these filters is to restrict the information we get at all, either directly from the blockchain or from the indexer.

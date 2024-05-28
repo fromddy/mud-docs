@@ -1,0 +1,580 @@
+import { CollapseCode } from "../../../components/CollapseCode";
+
+# Players and movement
+
+In this section, we will accomplish the following:
+
+- Spawn in each unique wallet address as an entity with the `Player`, `Movable`, and `Position` components.
+- Operate on a player's `Position` component with a system to create movement.
+- Optimistically render player movement in the client.
+
+## Create the components as tables
+
+To create tables in MUD we are going to edit the `mud.config.ts` file.
+You can define tables, their types, their schemas, and other types of information here.
+MUD then autogenerates all of the files needed to make sure your app knows these tables exist.
+
+We're going to start by defining three new tables:
+
+- `Player` to determine which entities are players (e.g. distinct wallet addresses).
+- `Movable` to determine whether or not an entity can move.
+- `Position` to determine which position an entity is located on a 2D grid.
+
+The syntax is as follows:
+
+<CollapseCode>
+
+```tsx filename="packages/contract/mud.config.ts" {8-20} copy showLineNumbers
+import { defineWorld } from "@latticexyz/world";
+
+export default defineWorld({
+  enums: {
+    Direction: ["North", "East", "South", "West"],
+  },
+  tables: {
+    Movable: "bool",
+    Player: "bool",
+    Position: {
+      schema: {
+        id: "bytes32",
+        x: "int32",
+        y: "int32",
+      },
+      key: ["id"],
+      codegen: {
+        dataStruct: false,
+      },
+    },
+  },
+});
+```
+
+</CollapseCode>
+
+<details>
+
+<summary>Explanation</summary>
+
+For `Movable` and `Player` tables, we use the "shorthand" table definition that just specifies a single value type. In these cases, MUD defaults the `schema` to an `id` key of `bytes32` and uses the specified type for the `value` field.
+The `id` key in these cases is the entity ID for the entities being described.
+In Solidity and the EVM, there is no distinction between an unset variable and zero/false.
+So by default entites are neither `Movable` nor a `Player`.
+
+The `Position` table defines the full schema with an `id` key to match our other tables as well as `x` and `y` coordinate fields. For better ergonomics, we turn off the "data struct" codegen option so our table library methods return an `(x, y)` tuple instead of a struct.
+
+</details>
+
+If after modifying the file you get an error on the `pnpm dev` process, restarting it should resolve the issue.
+
+## Create the map system and its methods
+
+In MUD, a system can have an arbitrary number of methods inside of it.
+Since we will be moving players around on a 2D map, we start the codebase off by creating a system that will encompass all of the methods related to the map: `MapSystem.sol` in `packages/contracts/src/systems`.
+
+### `spawn` method
+
+Before we add in the functionality of users moving we need to make sure each user is being properly identified as a player with the position and movable table. The former gives us a means of operating on it to create movement, and the latter allows us to grant the entity permission to use the move system.
+
+To solve for these problems we can add the `spawn` method, which will assign the `Player`, `Position`, and `Movable` tables we created earlier, inside of `MapSystem.sol`.
+
+<CollapseCode>
+
+```solidity filename="packages/contract/src/systems/MapSystem.sol" {4-5,8-15} copy showLineNumbers
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.24;
+import { System } from "@latticexyz/world/src/System.sol";
+import { Movable, Player, Position } from "../codegen/index.sol";
+import { addressToEntityKey } from "../addressToEntityKey.sol";
+
+contract MapSystem is System {
+  function spawn(int32 x, int32 y) public {
+    bytes32 player = addressToEntityKey(address(_msgSender()));
+    require(!Player.get(player), "already spawned");
+
+    Player.set(player, true);
+    Position.set(player, x, y);
+    Movable.set(player, true);
+  }
+}
+```
+
+</CollapseCode>
+
+<details>
+
+<summary>Explanation</summary>
+
+```solidity
+import { Movable, Player, Position } from "../codegen/index.sol";
+```
+
+Import the components we use from the automatically generated table list.
+
+```solidity
+import { addressToEntityKey } from "../addressToEntityKey.sol";
+```
+
+[This function](https://github.com/latticexyz/emojimon/blob/main/packages/contracts/src/addressToEntityKey.sol) converts an address, use as the player's, to a `bytes32` value that can identify an entity.
+
+```solidity
+  function spawn(int32 x, int32 y) public {
+```
+
+The `spawn` function spawns a new player entity on the map.
+
+```solidity
+    bytes32 player = addressToEntityKey(address(_msgSender()));
+```
+
+In certain cases systems are called by [a MUD `World`](/world) using the call opcode.
+In that case, `msg.sender()` is the `World` that called the system, not the actual player.
+`_msgSender()` takes care of this and gives us the real user identity, the one who called the `World`.
+
+```solidity
+    require(!Player.get(player), "already spawned");
+```
+
+To get a component value we use `<Component name>.get(<entity>)`.
+
+```solidity
+    Player.set(player, true);
+    Position.set(player, x, y);
+    Movable.set(player, true);
+  }
+```
+
+To set a component value we use `<Component name>.set(<entity>, <value>)`.
+
+</details>
+
+As you see, writing systems and their methods in MUD is similar to writing regular smart contracts. The key difference is that their state is defined and stored in tables rather than in the system contract itself.
+
+### `move` method
+
+Next we’ll add the `move` method to `MapSystem.sol`.
+This will allow us to move users (e.g. the user's wallet address as their entityID) by updating their `Position` table.
+
+<CollapseCode>
+
+```solidity filename="packages/contract/src/systems/MapSystem.sol" {5,18-34} copy showLineNumbers
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.24;
+import { System } from "@latticexyz/world/src/System.sol";
+import { Movable, Player, Position } from "../codegen/index.sol";
+import { Direction } from "../codegen/common.sol";
+import { addressToEntityKey } from "../addressToEntityKey.sol";
+
+contract MapSystem is System {
+  function spawn(uint32 x, uint32 y) public {
+    bytes32 player = addressToEntityKey(address(_msgSender()));
+    require(!Player.get(player), "already spawned");
+
+    Player.set(player, true);
+    Position.set(player, x, y);
+    Movable.set(player, true);
+  }
+
+  function move(Direction direction) public {
+    bytes32 player = addressToEntityKey(_msgSender());
+    require(Movable.get(player), "cannot move");
+
+    (int32 x, int32 y) = Position.get(player);
+    if (direction == Direction.North) {
+      y -= 1;
+    } else if (direction == Direction.East) {
+      x += 1;
+    } else if (direction == Direction.South) {
+      y += 1;
+    } else if (direction == Direction.West) {
+      x -= 1;
+    }
+
+    Position.set(player, x, y);
+  }
+}
+```
+
+</CollapseCode>
+
+<details>
+
+<summary>Explanation</summary>
+
+```solidity
+  function move(Direction direction) public {
+```
+
+We pass in the direction to move and mutate the onchain player position based on that direction.
+
+```solidity
+    require(Movable.get(player), "cannot move");
+```
+
+Make sure the entity (the player, in this case) can move.
+
+```solidity
+    (int32 x, int32 y) = Position.get(player);
+```
+
+Load the player's current onchain position.
+
+```solidity
+    if (direction == Direction.North) {
+      y -= 1;
+    } else if (direction == Direction.East) {
+      x += 1;
+    } else if (direction == Direction.South) {
+      y += 1;
+    } else if (direction == Direction.West) {
+      x -= 1;
+    }
+```
+
+Mutate the position according to the direction. You may notice that the Y coordinates are in reverse of what you might expect. We do this for ease of rendering in the browser, where the origin (`0,0`) is at the top-left corner of the screen (rather than bottom left).
+
+</details>
+
+This method will allow users to interact with a smart contract, auto-generated by MUD, to update their position.
+However, we are not yet able to visualize this on the client, so let's add that to make it feel more real.
+
+## Call the map system from the client
+
+We’ll fill in the `move` and `spawn` methods in our client’s `createSystemCalls.ts`.
+
+<CollapseCode>
+
+```tsx filename="packages/client/src/mud/createSystemCalls.ts" {9-10,13-24,28-38} copy showLineNumbers
+import { Has, HasValue, getComponentValue, runQuery } from "@latticexyz/recs";
+import { uuid } from "@latticexyz/utils";
+import { ClientComponents } from "./createClientComponents";
+import { SetupNetworkResult } from "./setupNetwork";
+
+export type SystemCalls = ReturnType<typeof createSystemCalls>;
+
+export function createSystemCalls(
+  { playerEntity, worldContract, waitForTransaction }: SetupNetworkResult,
+  { Player, Position }: ClientComponents,
+) {
+  const move = async (direction: Direction) => {
+    if (!playerEntity) {
+      throw new Error("no player");
+    }
+
+    const position = getComponentValue(Position, playerEntity);
+    if (!position) {
+      console.warn("cannot move without a player position, not yet spawned?");
+      return;
+    }
+
+    const tx = await worldContract.write.move([direction]);
+    await waitForTransaction(tx);
+  };
+
+  const spawn = async (x: number, y: number) => {
+    if (!playerEntity) {
+      throw new Error("no player");
+    }
+
+    const canSpawn = getComponentValue(Player, playerEntity)?.value !== true;
+    if (!canSpawn) {
+      throw new Error("already spawned");
+    }
+
+    const tx = await worldContract.write.spawn([x, y]);
+    await waitForTransaction(tx);
+  };
+
+  const throwBall = async () => {
+    // TODO
+    return null as any;
+  };
+
+  const fleeEncounter = async () => {
+    // TODO
+    return null as any;
+  };
+
+  return {
+    move,
+    spawn,
+    throwBall,
+    fleeEncounter,
+  };
+}
+```
+
+</CollapseCode>
+
+<details>
+
+<summary>Explanation</summary>
+
+```ts
+export function createSystemCalls(
+  { playerEntity, worldContract, waitForTransaction }: SetupNetworkResult,
+```
+
+From the network setup we get the user identity (`playerEntity`), the address of the `World` we use, and the function to wait for a transaction to be included.
+
+```ts
+  { Player, Position }: ClientComponents
+```
+
+The client code that uses the system calls needs the `Player` and `Position` components, as you'll see below.
+
+```ts
+  const move = async (direction: Direction) => {
+```
+
+This function moves the player in a specific direction.
+
+```ts
+if (!playerEntity) {
+  throw new Error("no player");
+}
+
+const playerPosition = getComponentValue(Position, playerEntity);
+if (!playerPosition) {
+  console.warn("cannot move without a player position, not yet spawned?");
+  return;
+}
+```
+
+If there is no player, or no player position, we can't move.
+Currently there is no way to spawn a player without setting a position, so this check is redundant - but we may introduce a spawn method in the future that is positionless, in which case we'll need it.
+
+```ts
+const tx = await worldContract.write.move([direction]);
+await waitForTransaction(tx);
+```
+
+This (`worldContract.write.<method>`) is the way we call a method on a system at the root namespace.
+
+```ts
+  const spawn = async (x: number, y: number) => {
+```
+
+Spawn a new player.
+It is very similar to `move` above.
+
+</details>
+
+Now we can apply all of these backend changes to the client by updating `GameBoard.tsx` to spawn the player when a map tile is clicked, show the player on the map, and move the player with the keyboard.
+
+<CollapseCode>
+
+```tsx filename="packages/client/src/GameBoard.tsx" {1,3-4,7-28} copy showLineNumbers
+import { useComponentValue } from "@latticexyz/react";
+import { GameMap } from "./GameMap";
+import { useMUD } from "./MUDContext";
+import { useKeyboardMovement } from "./useKeyboardMovement";
+
+export const GameBoard = () => {
+  useKeyboardMovement();
+
+  const {
+    components: { Player, Position },
+    network: { playerEntity },
+    systemCalls: { spawn },
+  } = useMUD();
+
+  const canSpawn = useComponentValue(Player, playerEntity)?.value !== true;
+
+  const playerPosition = useComponentValue(Position, playerEntity);
+  const player =
+    playerEntity && playerPosition
+      ? {
+          x: playerPosition.x,
+          y: playerPosition.y,
+          emoji: "🤠",
+          entity: playerEntity,
+        }
+      : null;
+
+  return <GameMap width={20} height={20} onTileClick={canSpawn ? spawn : undefined} players={player ? [player] : []} />;
+};
+```
+
+</CollapseCode>
+
+## Optimistic rendering
+
+Our player movement renders very slowly, because it waits for the onchain state to be updated, those updates propagate to our client, and then the map and player position updates accordingly. We can make this feel near-instant by adding optimistic rendering.
+
+First, we'll make our `Player` and `Position` components overridable.
+
+<CollapseCode>
+
+```typescript filename="packages/client/src/mud/createClientComponents.ts" {1,9-10} copy,showLineNumbers
+import { overridableComponent } from "@latticexyz/recs";
+import { SetupNetworkResult } from "./setupNetwork";
+
+export type ClientComponents = ReturnType<typeof createClientComponents>;
+
+export function createClientComponents({ components }: SetupNetworkResult) {
+  return {
+    ...components,
+    Player: overridableComponent(components.Player),
+    Position: overridableComponent(components.Position),
+  };
+}
+```
+
+</CollapseCode>
+
+This lets us "overlay" values while our `spawn` and `move` transactions are pending, which we'll add next.
+
+<CollapseCode>
+
+```typescript filename="packages/client/src/mud/createSystemCalls.ts" {3,25-42,45-47,60-71,74-77} copy,showLineNumbers
+import { getComponentValue } from "@latticexyz/recs";
+import { singletonEntity } from "@latticexyz/store-sync/recs";
+import { uuid } from "@latticexyz/utils";
+import { ClientComponents } from "./createClientComponents";
+import { SetupNetworkResult } from "./setupNetwork";
+import { Direction } from "../direction";
+
+export type SystemCalls = ReturnType<typeof createSystemCalls>;
+
+export function createSystemCalls(
+  { playerEntity, worldContract, waitForTransaction }: SetupNetworkResult,
+  { Player, Position }: ClientComponents,
+) {
+  const move = async (direction: Direction) => {
+    if (!playerEntity) {
+      throw new Error("no player");
+    }
+
+    const position = getComponentValue(Position, playerEntity);
+    if (!position) {
+      console.warn("cannot move without a player position, not yet spawned?");
+      return;
+    }
+
+    let { x, y } = position;
+    if (direction === Direction.North) {
+      y -= 1;
+    } else if (direction === Direction.East) {
+      x += 1;
+    } else if (direction === Direction.South) {
+      y += 1;
+    } else if (direction === Direction.West) {
+      x -= 1;
+    }
+
+    const positionId = uuid();
+    Position.addOverride(positionId, {
+      entity: playerEntity,
+      value: { x, y },
+    });
+
+    try {
+      const tx = await worldContract.write.move([direction]);
+      await waitForTransaction(tx);
+    } finally {
+      Position.removeOverride(positionId);
+    }
+  };
+
+  const spawn = async (x: number, y: number) => {
+    if (!playerEntity) {
+      throw new Error("no player");
+    }
+
+    const canSpawn = getComponentValue(Player, playerEntity)?.value !== true;
+    if (!canSpawn) {
+      throw new Error("already spawned");
+    }
+
+    const positionId = uuid();
+    Position.addOverride(positionId, {
+      entity: playerEntity,
+      value: { x, y },
+    });
+    const playerId = uuid();
+    Player.addOverride(playerId, {
+      entity: playerEntity,
+      value: { value: true },
+    });
+
+    try {
+      const tx = await worldContract.write.spawn([x, y]);
+      await waitForTransaction(tx);
+    } finally {
+      Position.removeOverride(positionId);
+      Player.removeOverride(playerId);
+    }
+  };
+
+  const throwBall = async () => {
+    // TODO
+    return null as any;
+  };
+
+  const fleeEncounter = async () => {
+    // TODO
+    return null as any;
+  };
+
+  return {
+    move,
+    spawn,
+    throwBall,
+    fleeEncounter,
+  };
+}
+```
+
+</CollapseCode>
+
+<details>
+
+<summary>Explanation</summary>
+
+```typescript
+let { x, y } = position;
+if (direction === Direction.North) {
+  y -= 1;
+} else if (direction === Direction.East) {
+  x += 1;
+} else if (direction === Direction.South) {
+  y += 1;
+} else if (direction === Direction.West) {
+  x -= 1;
+}
+```
+
+Mutate the position in the same way we do onchain. In the future, MUD will be able to better simulate contract calls in the client to avoid duplicating logic like this.
+
+```typescript
+const positionId = uuid();
+Position.addOverride(positionId, {
+  entity: playerEntity,
+  value: { x, y },
+});
+```
+
+Add a component value override for the player `Position`. We need to provide the override a unique ID so that we can later remove the value by this ID.
+
+```typescript
+try {
+  const tx = await worldContract.write.move([direction]);
+  await waitForTransaction(tx);
+} finally {
+  Position.removeOverride(positionId);
+}
+```
+
+Wrap our `move` contract call in a `try`/`catch` block and then, if the transaction call completes or fails for any reason, remove the override.
+
+For `spawn`, we do a similar approach, except we need to add overrides for both the `Player` and `Position` component values, to mirror what happens onchain.
+
+</details>
+
+You can run this command to update all the files to this point in the game's development.
+
+```sh copy
+git reset --hard step-1
+```
+
+Now that we have players, movement, and a basic map, let's start making improvements to the map itself.
