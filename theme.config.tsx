@@ -24,7 +24,7 @@ const config: DocsThemeConfig = {
     defaultTheme: "light",
   },
   footer: {
-    text: "MIT 2023 © MUD",
+    text: "MIT 2024 © MUD",
   },
   primaryHue: 28,
   sidebar: {
