@@ -1,4 +1,4 @@
-import worldPackageJson from "../../packages/world/package.json" with { type: "json" };
+import worldPackageJson from "./package.json" with { type: "json" };
 
 export default {
   introduction: {
